@@ -1,0 +1,126 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model Category {
+  id     String  @id @default(uuid())
+  name   String
+  assets Asset[]
+
+  @@map("categories")
+}
+
+model Location {
+  id      String  @id @default(uuid())
+  name    String
+  address String?
+  assets  Asset[]
+
+  @@map("locations")
+}
+
+model Employee {
+  id          String               @id @default(uuid())
+  name        String
+  department  String?
+  assets      Asset[]
+  assignments AssignmentHistory[]
+  requests    AssetRequest[]
+  user        User?
+
+  @@map("employees")
+}
+
+model Asset {
+  id               String             @id @default(uuid())
+  name             String
+  type             String?
+  invoiceNumber    String?
+  vendorName       String?
+  invoicePath      String?
+  categoryId       String
+  category         Category           @relation(fields: [categoryId], references: [id])
+  locationId       String
+  location         Location           @relation(fields: [locationId], references: [id])
+  status           String             @default("available")
+  serialNumber     String?
+  purchaseDate     DateTime?
+  value            Float?
+  quantity         Int                @default(1)
+  currentHolderId  String?
+  currentHolder    Employee?          @relation(fields: [currentHolderId], references: [id])
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  history          AssignmentHistory[]
+  requests         AssetRequest[]
+  units            AssetUnit[]
+
+  @@map("assets")
+}
+
+model AssetUnit {
+  id                         String             @id @default(uuid())
+  assetId                    String
+  asset                      Asset              @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  idNumber                   String             @unique
+  status                     String             @default("available")
+  condition                  String             @default("good")
+  conditionNote              String?
+  damageLevel                String?
+  urgency                    String?
+  currentAssignmentHistoryId String?
+  currentAssignmentHistory   AssignmentHistory? @relation(fields: [currentAssignmentHistoryId], references: [id])
+  createdAt                  DateTime           @default(now())
+
+  @@map("asset_units")
+}
+
+model AssignmentHistory {
+  id         String        @id @default(uuid())
+  assetId    String
+  asset      Asset         @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  employeeId String
+  employee   Employee      @relation(fields: [employeeId], references: [id])
+  quantity   Int           @default(1)
+  assignedAt DateTime      @default(now())
+  returnedAt DateTime?
+  note       String?
+  request    AssetRequest?
+  units      AssetUnit[]
+
+  @@map("assignment_history")
+}
+
+model AssetRequest {
+  id                  String             @id @default(uuid())
+  assetId             String
+  asset               Asset              @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  employeeId          String
+  employee            Employee           @relation(fields: [employeeId], references: [id])
+  quantity            Int
+  note                String?
+  documentPath        String
+  status              String             @default("pending")
+  requestedAt         DateTime           @default(now())
+  decidedAt           DateTime?
+  assignmentHistoryId String?            @unique
+  assignmentHistory   AssignmentHistory? @relation(fields: [assignmentHistoryId], references: [id])
+
+  @@map("asset_requests")
+}
+
+model User {
+  id         String    @id @default(uuid())
+  email      String    @unique
+  password   String
+  name       String
+  role       String    @default("admin")
+  employeeId String?   @unique
+  employee   Employee? @relation(fields: [employeeId], references: [id])
+
+  @@map("users")
+}
