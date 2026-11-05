@@ -3,78 +3,21 @@ import express from "express";
 import cors from "cors";
 import path from "path";
 import fs from "fs";
-import multer from "multer";
 import { prisma } from "./prisma";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { authMiddleware, requireRole, AuthRequest } from "./middleware/auth";
+import { uploadDir, invoiceUpload, singleDocument } from "./upload";
+import { purchaseRequestsRouter } from "./routes/purchaseRequests";
+import { delegationsRouter } from "./routes/delegations";
 import { ROLES, EMPLOYEE_ROLES, isRole } from "./roles";
-import { pickApprover, createsSupervisorCycle } from "./approver";
+import { pickApprover, createsSupervisorCycle, resolveApprover } from "./approver";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ===== Upload setup =====
-const uploadDir = path.join(__dirname, "..", "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-
-// Hanya PDF/JPG/PNG. Ekstensi file yang disimpan diambil dari daftar ini,
-// bukan dari nama file asli, supaya file .html dll. tidak bisa ikut tersaji.
-const ALLOWED_UPLOADS: Record<string, string> = {
-  "application/pdf": ".pdf",
-  "image/jpeg": ".jpg",
-  "image/png": ".png",
-};
-const ALLOWED_EXTENSIONS = [".pdf", ".jpg", ".jpeg", ".png"];
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
-  filename: (_req, file, cb) => {
-    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, unique + ALLOWED_UPLOADS[file.mimetype]);
-  },
-});
-
-function makeDocumentUpload(label: string) {
-  return multer({
-    storage,
-    limits: { fileSize: 5 * 1024 * 1024 },
-    fileFilter: (_req, file, cb) => {
-      const ext = path.extname(file.originalname).toLowerCase();
-      if (ALLOWED_UPLOADS[file.mimetype] && ALLOWED_EXTENSIONS.includes(ext)) cb(null, true);
-      else cb(new Error(`Format ${label} harus PDF, JPG, atau PNG`));
-    },
-  });
-}
-
-// Upload nota/invoice aset: hanya PDF/JPG/PNG, maks 5 MB
-const invoiceUpload = makeDocumentUpload("nota");
-
-// Middleware upload 1 file dokumen:
-// - error format/ukuran dikembalikan sebagai 400 dengan pesan yang jelas
-// - kalau request akhirnya gagal (status >= 400), file yang sudah tersimpan dihapus
-function singleDocument(field: string, label: string) {
-  const uploader = makeDocumentUpload(label).single(field);
-  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    uploader(req, res, (err: unknown) => {
-      if (err) {
-        const msg =
-          (err as any)?.code === "LIMIT_FILE_SIZE"
-            ? `Ukuran ${label} maksimal 5 MB`
-            : err instanceof Error
-            ? err.message
-            : String(err);
-        return res.status(400).json({ message: msg });
-      }
-      res.on("finish", () => {
-        if (res.statusCode >= 400 && req.file) fs.unlink(req.file.path, () => {});
-      });
-      next();
-    });
-  };
-}
-
 app.use(
   "/uploads",
   express.static(uploadDir, {
@@ -118,6 +61,35 @@ app.use(authMiddleware);
 
 const adminOnly = requireRole(ROLES.ADMIN);
 const employeeOnly = requireRole(...EMPLOYEE_ROLES);
+
+// Profil user yang login (dipakai form pengajuan untuk data pemohon & approver)
+app.get("/me", async (req: AuthRequest, res) => {
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    select: {
+      id: true,
+      email: true,
+      name: true,
+      role: true,
+      employee: {
+        select: {
+          id: true,
+          name: true,
+          position: true,
+          phone: true,
+          department: { select: { id: true, name: true } },
+        },
+      },
+    },
+  });
+  if (!user) return res.status(404).json({ message: "Akun tidak ditemukan" });
+  const approver = user.employee ? await resolveApprover(user.employee.id) : null;
+  res.json({ ...user, approver });
+});
+
+// ===== Pengadaan aset & delegasi approval =====
+app.use("/purchase-requests", purchaseRequestsRouter);
+app.use("/delegations", delegationsRouter);
 
 // Jumlah unit yang rusak dan sedang tidak dipinjam, per aset.
 // Unit seperti ini tidak dihitung sebagai stok tersedia.

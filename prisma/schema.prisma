@@ -35,48 +35,50 @@ model Department {
 }
 
 model Employee {
-  id           String              @id @default(uuid())
-  name         String
-  position     String?
-  phone        String?
-  departmentId String?
-  department   Department?         @relation("DepartmentMembers", fields: [departmentId], references: [id], onDelete: SetNull)
+  id                        String              @id @default(uuid())
+  name                      String
+  position                  String?
+  phone                     String?
+  departmentId              String?
+  department                Department?         @relation("DepartmentMembers", fields: [departmentId], references: [id], onDelete: SetNull)
   // Atasan langsung: approver pertama untuk request pengadaan
-  supervisorId String?
-  supervisor   Employee?           @relation("Supervisor", fields: [supervisorId], references: [id], onDelete: SetNull)
-  subordinates Employee[]          @relation("Supervisor")
-  headOf       Department[]        @relation("DepartmentHead")
-  assets       Asset[]
-  assignments  AssignmentHistory[]
-  requests     AssetRequest[]
-  user         User?
+  supervisorId              String?
+  supervisor                Employee?           @relation("Supervisor", fields: [supervisorId], references: [id], onDelete: SetNull)
+  subordinates              Employee[]          @relation("Supervisor")
+  headOf                    Department[]        @relation("DepartmentHead")
+  assets                    Asset[]
+  assignments               AssignmentHistory[]
+  requests                  AssetRequest[]
+  user                      User?
+  purchaseRequests          PurchaseRequest[]   @relation("PRRequester")
+  purchaseRequestsToApprove PurchaseRequest[]   @relation("PRSupervisorApprover")
 
   @@map("employees")
 }
 
 model Asset {
-  id               String             @id @default(uuid())
-  name             String
-  type             String?
-  invoiceNumber    String?
-  vendorName       String?
-  invoicePath      String?
-  categoryId       String
-  category         Category           @relation(fields: [categoryId], references: [id])
-  locationId       String
-  location         Location           @relation(fields: [locationId], references: [id])
-  status           String             @default("available")
-  serialNumber     String?
-  purchaseDate     DateTime?
-  value            Float?
-  quantity         Int                @default(1)
-  currentHolderId  String?
-  currentHolder    Employee?          @relation(fields: [currentHolderId], references: [id])
-  createdAt        DateTime           @default(now())
-  updatedAt        DateTime           @updatedAt
-  history          AssignmentHistory[]
-  requests         AssetRequest[]
-  units            AssetUnit[]
+  id              String              @id @default(uuid())
+  name            String
+  type            String?
+  invoiceNumber   String?
+  vendorName      String?
+  invoicePath     String?
+  categoryId      String
+  category        Category            @relation(fields: [categoryId], references: [id])
+  locationId      String
+  location        Location            @relation(fields: [locationId], references: [id])
+  status          String              @default("available")
+  serialNumber    String?
+  purchaseDate    DateTime?
+  value           Float?
+  quantity        Int                 @default(1)
+  currentHolderId String?
+  currentHolder   Employee?           @relation(fields: [currentHolderId], references: [id])
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  history         AssignmentHistory[]
+  requests        AssetRequest[]
+  units           AssetUnit[]
 
   @@map("assets")
 }
@@ -141,5 +143,115 @@ model User {
   employeeId String?   @unique
   employee   Employee? @relation(fields: [employeeId], references: [id])
 
+  purchaseLogsActed    PurchaseRequestLog[] @relation("PRLogActor")
+  purchaseLogsOnBehalf PurchaseRequestLog[] @relation("PRLogOnBehalf")
+  delegationsGiven     ApprovalDelegation[] @relation("DelegationDelegator")
+  delegationsReceived  ApprovalDelegation[] @relation("DelegationDelegate")
+  delegationsCreated   ApprovalDelegation[] @relation("DelegationCreatedBy")
+
   @@map("users")
+}
+
+// ===== Pengadaan aset (purchase request) =====
+
+model PurchaseRequest {
+  id        String  @id @default(uuid())
+  // nomor urut internal; docNumber (format dokumen) disusun dari sini dan bisa diganti formatnya nanti
+  seq       Int     @unique @default(autoincrement())
+  docNumber String? @unique
+
+  requesterId String
+  requester   Employee @relation("PRRequester", fields: [requesterId], references: [id])
+
+  // Snapshot data pemohon saat pengajuan, supaya dokumen tidak berubah
+  // walaupun data karyawan diubah belakangan.
+  requesterName       String
+  requesterPosition   String?
+  requesterDepartment String?
+  requesterEmail      String?
+  requesterPhone      String?
+
+  requirementType   String // product | service | troubleshooting | ticket | material | other
+  requirementAction String // new | upgrade | downgrade | additional
+  requirementScope  String // internal | external
+  purpose           String   @db.Text
+  dueDate           DateTime @db.Date
+  note              String?  @db.Text
+  attachmentPath    String?
+  attachmentName    String?
+  totalEstimate     Decimal  @db.Decimal(15, 2)
+
+  status String
+
+  // Approver tahap atasan, ditentukan saat pengajuan. null = tahap atasan dilewati.
+  supervisorApproverId String?
+  supervisorApprover   Employee? @relation("PRSupervisorApprover", fields: [supervisorApproverId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items PurchaseRequestItem[]
+  logs  PurchaseRequestLog[]
+
+  @@index([status])
+  @@map("purchase_requests")
+}
+
+model PurchaseRequestItem {
+  id             String          @id @default(uuid())
+  requestId      String
+  request        PurchaseRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  lineNo         Int
+  description    String          @db.Text
+  quantity       Int
+  estimatedPrice Decimal         @db.Decimal(15, 2)
+
+  @@index([requestId])
+  @@map("purchase_request_items")
+}
+
+// Riwayat / timeline. Satu baris per tindakan (submit, approve, reject, dilewati).
+model PurchaseRequestLog {
+  id        String          @id @default(uuid())
+  requestId String
+  request   PurchaseRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  step      String // SUBMIT | SUPERVISOR | GA | FINANCE
+  action    String // SUBMITTED | APPROVED | REJECTED | SKIPPED
+
+  actorUserId   String?
+  actor         User?   @relation("PRLogActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorName     String?
+  actorPosition String?
+
+  // Diisi kalau tindakan dilakukan lewat delegasi ("a.n.")
+  onBehalfOfUserId   String?
+  onBehalfOf         User?   @relation("PRLogOnBehalf", fields: [onBehalfOfUserId], references: [id], onDelete: SetNull)
+  onBehalfOfName     String?
+  onBehalfOfPosition String?
+
+  note      String?  @db.Text
+  createdAt DateTime @default(now())
+
+  @@index([requestId])
+  @@map("purchase_request_logs")
+}
+
+// Delegasi approval: selama periode aktif, delegate bisa approve atas nama delegator.
+model ApprovalDelegation {
+  id          String    @id @default(uuid())
+  delegatorId String
+  delegator   User      @relation("DelegationDelegator", fields: [delegatorId], references: [id], onDelete: Cascade)
+  delegateId  String
+  delegate    User      @relation("DelegationDelegate", fields: [delegateId], references: [id], onDelete: Cascade)
+  startDate   DateTime  @db.Date
+  endDate     DateTime  @db.Date
+  note        String?
+  createdById String?
+  createdBy   User?     @relation("DelegationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  cancelledAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([delegateId])
+  @@index([delegatorId])
+  @@map("approval_delegations")
 }
