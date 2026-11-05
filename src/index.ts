@@ -3,43 +3,27 @@ import express from "express";
 import cors from "cors";
 import path from "path";
 import fs from "fs";
-import multer from "multer";
 import { prisma } from "./prisma";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { authMiddleware, AuthRequest } from "./middleware/auth";
+import { authMiddleware, requireRole, AuthRequest } from "./middleware/auth";
+import { uploadDir, invoiceUpload, singleDocument } from "./upload";
+import { purchaseRequestsRouter } from "./routes/purchaseRequests";
+import { delegationsRouter } from "./routes/delegations";
+import { ROLES, EMPLOYEE_ROLES, isRole } from "./roles";
+import { pickApprover, createsSupervisorCycle, resolveApprover } from "./approver";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ===== Upload setup =====
-const uploadDir = path.join(__dirname, "..", "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
-  filename: (_req, file, cb) => {
-    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, unique + path.extname(file.originalname));
-  },
-});
-const upload = multer({ storage });
-
-// Upload nota/invoice aset: hanya PDF/JPG/PNG, maks 5 MB
-const invoiceUpload = multer({
-  storage,
-  limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    const ok = ["application/pdf", "image/jpeg", "image/png"].includes(
-      file.mimetype
-    );
-    if (ok) cb(null, true);
-    else cb(new Error("Format nota harus PDF, JPG, atau PNG"));
-  },
-});
-
-app.use("/uploads", express.static(uploadDir));
+app.use(
+  "/uploads",
+  express.static(uploadDir, {
+    setHeaders: (res) => res.setHeader("X-Content-Type-Options", "nosniff"),
+  })
+);
 
 // ===== Auth =====
 app.post("/auth/login", async (req, res) => {
@@ -74,6 +58,38 @@ app.post("/auth/login", async (req, res) => {
 });
 
 app.use(authMiddleware);
+
+const adminOnly = requireRole(ROLES.ADMIN);
+const employeeOnly = requireRole(...EMPLOYEE_ROLES);
+
+// Profil user yang login (dipakai form pengajuan untuk data pemohon & approver)
+app.get("/me", async (req: AuthRequest, res) => {
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    select: {
+      id: true,
+      email: true,
+      name: true,
+      role: true,
+      employee: {
+        select: {
+          id: true,
+          name: true,
+          position: true,
+          phone: true,
+          department: { select: { id: true, name: true } },
+        },
+      },
+    },
+  });
+  if (!user) return res.status(404).json({ message: "Akun tidak ditemukan" });
+  const approver = user.employee ? await resolveApprover(user.employee.id) : null;
+  res.json({ ...user, approver });
+});
+
+// ===== Pengadaan aset & delegasi approval =====
+app.use("/purchase-requests", purchaseRequestsRouter);
+app.use("/delegations", delegationsRouter);
 
 // Jumlah unit yang rusak dan sedang tidak dipinjam, per aset.
 // Unit seperti ini tidak dihitung sebagai stok tersedia.
@@ -124,7 +140,7 @@ app.get("/assets", async (_req, res) => {
   res.json(result);
 });
 
-app.get("/assets/:id", async (req, res) => {
+app.get("/assets/:id", adminOnly, async (req, res) => {
   const asset = await prisma.asset.findUnique({ where: { id: req.params.id } });
   if (!asset) return res.status(404).json({ message: "Asset not found" });
 
@@ -150,7 +166,7 @@ function makeUnitPrefix(name: string) {
     .replace(/^-+|-+$/g, "");
 }
 
-app.get("/assets/:id/units", async (req, res) => {
+app.get("/assets/:id/units", adminOnly, async (req, res) => {
   const units = await prisma.assetUnit.findMany({
     where: { assetId: req.params.id },
     orderBy: { idNumber: "asc" },
@@ -159,7 +175,7 @@ app.get("/assets/:id/units", async (req, res) => {
 });
 
 // GET semua unit dari semua aset (buat halaman Inventaris)
-app.get("/asset-units", async (req, res) => {
+app.get("/asset-units", adminOnly, async (req, res) => {
   try {
     const units = await prisma.assetUnit.findMany({
       include: {
@@ -180,7 +196,7 @@ app.get("/asset-units", async (req, res) => {
 });
 
 // Ubah kondisi unit (baik / rusak)
-app.put("/units/:unitId/condition", async (req: AuthRequest, res) => {
+app.put("/units/:unitId/condition", adminOnly, async (req: AuthRequest, res) => {
   if (req.user?.role !== "admin") {
     return res
       .status(403)
@@ -220,7 +236,7 @@ app.put("/units/:unitId/condition", async (req: AuthRequest, res) => {
 });
 
 // Ubah ID Number unit
-app.put("/units/:unitId/id-number", async (req: AuthRequest, res) => {
+app.put("/units/:unitId/id-number", adminOnly, async (req: AuthRequest, res) => {
   if (req.user?.role !== "admin") {
     return res
       .status(403)
@@ -253,7 +269,7 @@ app.put("/units/:unitId/id-number", async (req: AuthRequest, res) => {
   }
 });
 
-app.post("/assets", (req, res) => {
+app.post("/assets", adminOnly, (req, res) => {
   invoiceUpload.single("invoice")(req, res, async (uploadErr) => {
     if (uploadErr) {
       const msg =
@@ -321,16 +337,16 @@ app.post("/assets", (req, res) => {
   });
 });
 
-app.get("/assets/:id/history", async (req, res) => {
+app.get("/assets/:id/history", adminOnly, async (req, res) => {
   const history = await prisma.assignmentHistory.findMany({
     where: { assetId: req.params.id },
-    include: { employee: true },
+    include: { employee: { include: { department: { select: { id: true, name: true } } } } },
     orderBy: { assignedAt: "desc" },
   });
   res.json(history);
 });
 
-app.put("/assets/:id", async (req, res) => {
+app.put("/assets/:id", adminOnly, async (req, res) => {
   try {
     if (req.body.quantity !== undefined) {
       const newQty = Number(req.body.quantity);
@@ -361,7 +377,7 @@ app.put("/assets/:id", async (req, res) => {
   }
 });
 
-app.delete("/assets/:id", async (req, res) => {
+app.delete("/assets/:id", adminOnly, async (req, res) => {
   try {
     await prisma.asset.delete({ where: { id: req.params.id } });
     res.status(204).send();
@@ -371,12 +387,12 @@ app.delete("/assets/:id", async (req, res) => {
 });
 
 // ===== Category =====
-app.get("/categories", async (_req, res) => {
+app.get("/categories", adminOnly, async (_req, res) => {
   const categories = await prisma.category.findMany();
   res.json(categories);
 });
 
-app.post("/categories", async (req, res) => {
+app.post("/categories", adminOnly, async (req, res) => {
   try {
     const category = await prisma.category.create({ data: req.body });
     res.status(201).json(category);
@@ -385,7 +401,7 @@ app.post("/categories", async (req, res) => {
   }
 });
 
-app.put("/categories/:id", async (req, res) => {
+app.put("/categories/:id", adminOnly, async (req, res) => {
   try {
     const category = await prisma.category.update({
       where: { id: req.params.id },
@@ -397,7 +413,7 @@ app.put("/categories/:id", async (req, res) => {
   }
 });
 
-app.delete("/categories/:id", async (req, res) => {
+app.delete("/categories/:id", adminOnly, async (req, res) => {
   try {
     await prisma.category.delete({ where: { id: req.params.id } });
     res.status(204).send();
@@ -407,12 +423,12 @@ app.delete("/categories/:id", async (req, res) => {
 });
 
 // ===== Location =====
-app.get("/locations", async (_req, res) => {
+app.get("/locations", adminOnly, async (_req, res) => {
   const locations = await prisma.location.findMany();
   res.json(locations);
 });
 
-app.get("/locations/:id", async (req, res) => {
+app.get("/locations/:id", adminOnly, async (req, res) => {
   const location = await prisma.location.findUnique({ where: { id: req.params.id } });
   if (!location) {
     return res.status(404).json({ message: "Location not found" });
@@ -443,7 +459,7 @@ app.get("/locations/:id", async (req, res) => {
   res.json({ ...location, assets: assetsWithStock });
 });
 
-app.post("/locations", async (req, res) => {
+app.post("/locations", adminOnly, async (req, res) => {
   try {
     const location = await prisma.location.create({ data: req.body });
     res.status(201).json(location);
@@ -452,7 +468,7 @@ app.post("/locations", async (req, res) => {
   }
 });
 
-app.put("/locations/:id", async (req, res) => {
+app.put("/locations/:id", adminOnly, async (req, res) => {
   try {
     const location = await prisma.location.update({
       where: { id: req.params.id },
@@ -464,7 +480,7 @@ app.put("/locations/:id", async (req, res) => {
   }
 });
 
-app.delete("/locations/:id", async (req, res) => {
+app.delete("/locations/:id", adminOnly, async (req, res) => {
   try {
     await prisma.location.delete({ where: { id: req.params.id } });
     res.status(204).send();
@@ -474,56 +490,214 @@ app.delete("/locations/:id", async (req, res) => {
 });
 
 // ===== Employee =====
-app.get("/employees", async (_req, res) => {
+const employeeInclude = {
+  user: { select: { id: true, email: true, role: true } },
+  department: { select: { id: true, name: true, head: { select: { id: true, name: true } } } },
+  supervisor: { select: { id: true, name: true } },
+} as const;
+
+// Ambil hanya field yang boleh diubah dari body. Field yang tidak dikirim dibiarkan.
+function parseEmployeeInput(body: any) {
+  const clean = (v: unknown) =>
+    typeof v === "string" && v.trim() !== "" ? v.trim() : null;
+  const data: {
+    name?: string;
+    position?: string | null;
+    phone?: string | null;
+    departmentId?: string | null;
+    supervisorId?: string | null;
+  } = {};
+  if (body?.name !== undefined) data.name = clean(body.name) ?? "";
+  for (const key of ["position", "phone", "departmentId", "supervisorId"] as const) {
+    if (body?.[key] !== undefined) data[key] = clean(body[key]);
+  }
+  return data;
+}
+
+async function validateEmployeeInput(
+  data: ReturnType<typeof parseEmployeeInput>,
+  employeeId?: string
+): Promise<string | null> {
+  if (data.name !== undefined && !data.name) return "Nama karyawan wajib diisi";
+  if (data.departmentId) {
+    const dept = await prisma.department.findUnique({ where: { id: data.departmentId } });
+    if (!dept) return "Departemen tidak ditemukan";
+  }
+  if (data.supervisorId) {
+    if (data.supervisorId === employeeId) return "Karyawan tidak bisa menjadi atasan dirinya sendiri";
+    const sup = await prisma.employee.findUnique({ where: { id: data.supervisorId } });
+    if (!sup) return "Atasan tidak ditemukan";
+    if (employeeId && (await createsSupervisorCycle(employeeId, data.supervisorId))) {
+      return "Atasan tidak valid: membuat rantai atasan yang melingkar";
+    }
+  }
+  return null;
+}
+
+app.get("/employees", adminOnly, async (_req, res) => {
   const employees = await prisma.employee.findMany({
-    include: { user: { select: { email: true } } },
+    include: employeeInclude,
+    orderBy: { name: "asc" },
   });
-  res.json(employees);
+  res.json(employees.map((e) => ({ ...e, approver: pickApprover(e) })));
 });
 
-app.post("/employees", async (req, res) => {
+app.post("/employees", adminOnly, async (req, res) => {
+  const data = parseEmployeeInput(req.body);
+  if (data.name === undefined) data.name = "";
+  const invalid = await validateEmployeeInput(data);
+  if (invalid) return res.status(400).json({ message: invalid });
+
   try {
-    const employee = await prisma.employee.create({ data: req.body });
+    const employee = await prisma.employee.create({
+      data: data as typeof data & { name: string },
+      include: employeeInclude,
+    });
     res.status(201).json(employee);
   } catch (e) {
-    res.status(400).json({ message: "Invalid data", error: String(e) });
+    res.status(400).json({ message: "Gagal menambah karyawan", error: String(e) });
   }
 });
 
-app.put("/employees/:id", async (req, res) => {
+app.put("/employees/:id", adminOnly, async (req, res) => {
+  const id = req.params.id as string;
+  const existing = await prisma.employee.findUnique({ where: { id } });
+  if (!existing) return res.status(404).json({ message: "Employee not found" });
+
+  const data = parseEmployeeInput(req.body);
+  const invalid = await validateEmployeeInput(data, id);
+  if (invalid) return res.status(400).json({ message: invalid });
+
   try {
-    const employee = await prisma.employee.update({
-      where: { id: req.params.id },
-      data: req.body,
+    const employee = await prisma.$transaction(async (tx) => {
+      const updated = await tx.employee.update({ where: { id }, data, include: employeeInclude });
+      // nama di akun ikut disesuaikan
+      if (data.name) {
+        await tx.user.updateMany({ where: { employeeId: id }, data: { name: data.name } });
+      }
+      return updated;
     });
     res.json(employee);
-  } catch {
-    res.status(404).json({ message: "Employee not found" });
+  } catch (e) {
+    res.status(400).json({ message: "Gagal menyimpan karyawan", error: String(e) });
   }
 });
 
-app.delete("/employees/:id", async (req, res) => {
+app.delete("/employees/:id", adminOnly, async (req, res) => {
   try {
-    await prisma.employee.delete({ where: { id: req.params.id } });
+    await prisma.employee.delete({ where: { id: req.params.id as string } });
     res.status(204).send();
   } catch {
-    res.status(404).json({ message: "Employee not found" });
+    res.status(400).json({
+      message: "Gagal menghapus karyawan (mungkin masih punya riwayat peminjaman atau request)",
+    });
   }
 });
 
-// ===== Staff Account =====
-app.post("/employees/:id/create-account", async (req: AuthRequest, res) => {
-  if (req.user?.role !== "admin") {
-    return res.status(403).json({ message: "Hanya admin yang bisa membuat akun staff" });
-  }
+// ===== Department =====
+app.get("/departments", adminOnly, async (_req, res) => {
+  const departments = await prisma.department.findMany({
+    include: {
+      head: { select: { id: true, name: true } },
+      _count: { select: { employees: true } },
+    },
+    orderBy: { name: "asc" },
+  });
+  res.json(departments);
+});
 
-  const { email, password } = req.body;
+async function parseDepartmentInput(body: any): Promise<
+  { ok: true; data: { name?: string; headId?: string | null } } | { ok: false; message: string }
+> {
+  const data: { name?: string; headId?: string | null } = {};
+  if (body?.name !== undefined) {
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) return { ok: false, message: "Nama departemen wajib diisi" };
+    data.name = name;
+  }
+  if (body?.headId !== undefined) {
+    const headId = typeof body.headId === "string" && body.headId ? body.headId : null;
+    if (headId && !(await prisma.employee.findUnique({ where: { id: headId } }))) {
+      return { ok: false, message: "Kepala departemen tidak ditemukan" };
+    }
+    data.headId = headId;
+  }
+  return { ok: true, data };
+}
+
+function departmentError(res: express.Response, e: unknown) {
+  if ((e as any)?.code === "P2002") {
+    return res.status(400).json({ message: "Nama departemen sudah ada" });
+  }
+  return res.status(400).json({ message: "Gagal menyimpan departemen", error: String(e) });
+}
+
+app.post("/departments", adminOnly, async (req, res) => {
+  const parsed = await parseDepartmentInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ message: parsed.message });
+  if (!parsed.data.name) return res.status(400).json({ message: "Nama departemen wajib diisi" });
+  try {
+    const dept = await prisma.department.create({
+      data: { name: parsed.data.name, headId: parsed.data.headId ?? null },
+    });
+    res.status(201).json(dept);
+  } catch (e) {
+    departmentError(res, e);
+  }
+});
+
+app.put("/departments/:id", adminOnly, async (req, res) => {
+  const parsed = await parseDepartmentInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ message: parsed.message });
+  try {
+    const dept = await prisma.department.update({
+      where: { id: req.params.id as string },
+      data: parsed.data,
+    });
+    res.json(dept);
+  } catch (e) {
+    if ((e as any)?.code === "P2025") return res.status(404).json({ message: "Departemen tidak ditemukan" });
+    departmentError(res, e);
+  }
+});
+
+app.delete("/departments/:id", adminOnly, async (req, res) => {
+  try {
+    // karyawan di departemen ini otomatis jadi tanpa departemen (ON DELETE SET NULL)
+    await prisma.department.delete({ where: { id: req.params.id as string } });
+    res.status(204).send();
+  } catch {
+    res.status(404).json({ message: "Departemen tidak ditemukan" });
+  }
+});
+
+// ===== Akun user =====
+app.post("/employees/:id/create-account", adminOnly, async (req: AuthRequest, res) => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  const role = req.body?.role ?? ROLES.STAFF;
   const employeeId = req.params.id as string;
 
+  if (!email || !password) {
+    return res.status(400).json({ message: "Email dan password wajib diisi" });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ message: "Password minimal 6 karakter" });
+  }
+  if (!isRole(role)) {
+    return res.status(400).json({ message: "Role tidak valid" });
+  }
+
   try {
-    const employee = await prisma.employee.findUnique({ where: { id: employeeId } });
+    const employee = await prisma.employee.findUnique({
+      where: { id: employeeId },
+      include: { user: true },
+    });
     if (!employee) {
       return res.status(404).json({ message: "Employee not found" });
+    }
+    if (employee.user) {
+      return res.status(400).json({ message: "Karyawan ini sudah punya akun" });
     }
 
     const existing = await prisma.user.findUnique({ where: { email } });
@@ -537,19 +711,47 @@ app.post("/employees/:id/create-account", async (req: AuthRequest, res) => {
         email,
         password: hashed,
         name: employee.name,
-        role: "staff",
+        role,
         employeeId: employee.id,
       },
     });
 
-    res.status(201).json({ id: user.id, email: user.email, name: user.name });
+    res.status(201).json({ id: user.id, email: user.email, name: user.name, role: user.role });
   } catch (e) {
     res.status(400).json({ message: "Gagal membuat akun", error: String(e) });
   }
 });
 
+app.put("/users/:id/role", adminOnly, async (req: AuthRequest, res) => {
+  const userId = req.params.id as string;
+  const role = req.body?.role;
+
+  if (!isRole(role)) {
+    return res.status(400).json({ message: "Role tidak valid" });
+  }
+  if (userId === req.user!.id) {
+    return res.status(400).json({ message: "Tidak bisa mengubah role akun sendiri" });
+  }
+
+  const target = await prisma.user.findUnique({ where: { id: userId } });
+  if (!target) return res.status(404).json({ message: "Akun tidak ditemukan" });
+
+  if ((EMPLOYEE_ROLES as string[]).includes(role) && !target.employeeId) {
+    return res.status(400).json({ message: "Role ini hanya untuk akun yang terhubung ke data karyawan" });
+  }
+  if (target.role === ROLES.ADMIN && role !== ROLES.ADMIN) {
+    const admins = await prisma.user.count({ where: { role: ROLES.ADMIN } });
+    if (admins <= 1) {
+      return res.status(400).json({ message: "Minimal harus ada satu Super Admin" });
+    }
+  }
+
+  const updated = await prisma.user.update({ where: { id: userId }, data: { role } });
+  res.json({ id: updated.id, email: updated.email, role: updated.role });
+});
+
 // ===== Assignment (berbasis stok) =====
-app.post("/assets/:id/assign", async (req, res) => {
+app.post("/assets/:id/assign", adminOnly, async (req, res) => {
   const { employeeId, quantity, note } = req.body;
 
   try {
@@ -612,7 +814,7 @@ app.post("/assets/:id/return", async (req: AuthRequest, res) => {
       return res.status(400).json({ message: "Data peminjaman tidak valid" });
     }
 
-    if (req.user?.role === "staff" && record.employeeId !== req.user.employeeId) {
+    if (req.user?.role !== ROLES.ADMIN && record.employeeId !== req.user?.employeeId) {
       return res.status(403).json({ message: "Tidak bisa mengembalikan aset milik orang lain" });
     }
 
@@ -636,13 +838,14 @@ app.post("/assets/:id/return", async (req: AuthRequest, res) => {
 
 // ===== Asset Request (staff) =====
 app.get("/requests", async (req: AuthRequest, res) => {
-  const where = req.user?.role === "staff" ? { employeeId: req.user.employeeId || "" } : {};
+  const where =
+    req.user?.role === ROLES.ADMIN ? {} : { employeeId: req.user?.employeeId || "" };
 
   const requests = await prisma.assetRequest.findMany({
     where,
     include: {
       asset: true,
-      employee: true,
+      employee: { include: { department: { select: { id: true, name: true } } } },
       assignmentHistory: { select: { id: true, returnedAt: true } },
     },
     orderBy: { requestedAt: "desc" },
@@ -650,10 +853,10 @@ app.get("/requests", async (req: AuthRequest, res) => {
   res.json(requests);
 });
 
-app.post("/requests", upload.single("document"), async (req: AuthRequest, res) => {
+app.post("/requests", employeeOnly, singleDocument("document", "dokumen surat jalan"), async (req: AuthRequest, res) => {
   try {
-    if (req.user?.role !== "staff" || !req.user.employeeId) {
-      return res.status(403).json({ message: "Hanya staff yang bisa membuat request" });
+    if (!req.user?.employeeId) {
+      return res.status(403).json({ message: "Akun ini tidak terhubung ke data karyawan" });
     }
 
     const { assetId, note } = req.body;
@@ -705,7 +908,7 @@ app.post("/requests", upload.single("document"), async (req: AuthRequest, res) =
   }
 });
 
-app.put("/requests/:id/approve", async (req: AuthRequest, res) => {
+app.put("/requests/:id/approve", adminOnly, async (req: AuthRequest, res) => {
   if (req.user?.role !== "admin") {
     return res.status(403).json({ message: "Hanya admin yang bisa approve" });
   }
@@ -762,7 +965,7 @@ app.put("/requests/:id/approve", async (req: AuthRequest, res) => {
   }
 });
 
-app.put("/requests/:id/reject", async (req: AuthRequest, res) => {
+app.put("/requests/:id/reject", adminOnly, async (req: AuthRequest, res) => {
   if (req.user?.role !== "admin") {
     return res.status(403).json({ message: "Hanya admin yang bisa reject" });
   }
@@ -787,7 +990,7 @@ app.put("/requests/:id/reject", async (req: AuthRequest, res) => {
 });
 
 // ===== Dashboard Stats =====
-app.get("/dashboard/stats", async (_req, res) => {
+app.get("/dashboard/stats", adminOnly, async (_req, res) => {
   try {
     const assets = await prisma.asset.findMany({
       include: { category: true },
@@ -819,7 +1022,7 @@ app.get("/dashboard/stats", async (_req, res) => {
     const recentHistoryRaw = await prisma.assignmentHistory.findMany({
       orderBy: { assignedAt: "desc" },
       take: 10,
-      include: { employee: true, asset: true },
+      include: { employee: { include: { department: { select: { id: true, name: true } } } }, asset: true },
     });
 
     const recentHistory = recentHistoryRaw.map((h) => ({
@@ -834,13 +1037,13 @@ app.get("/dashboard/stats", async (_req, res) => {
     const activeBorrowsRaw = await prisma.assignmentHistory.findMany({
       where: { returnedAt: null },
       orderBy: { assignedAt: "desc" },
-      include: { employee: true, asset: true },
+      include: { employee: { include: { department: { select: { id: true, name: true } } } }, asset: true },
     });
 
     const activeBorrows = activeBorrowsRaw.map((h) => ({
       id: h.id,
       employeeName: h.employee.name,
-      department: h.employee.department,
+      department: h.employee.department?.name ?? null,
       assetName: h.asset.name,
       quantity: h.quantity,
       assignedAt: h.assignedAt,
