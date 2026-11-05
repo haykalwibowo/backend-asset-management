@@ -23,14 +23,33 @@ model Location {
   @@map("locations")
 }
 
+model Department {
+  id        String     @id @default(uuid())
+  name      String     @unique
+  // Kepala departemen: approver default kalau karyawan tidak punya atasan langsung
+  headId    String?
+  head      Employee?  @relation("DepartmentHead", fields: [headId], references: [id], onDelete: SetNull)
+  employees Employee[] @relation("DepartmentMembers")
+
+  @@map("departments")
+}
+
 model Employee {
-  id          String               @id @default(uuid())
-  name        String
-  department  String?
-  assets      Asset[]
-  assignments AssignmentHistory[]
-  requests    AssetRequest[]
-  user        User?
+  id           String              @id @default(uuid())
+  name         String
+  position     String?
+  phone        String?
+  departmentId String?
+  department   Department?         @relation("DepartmentMembers", fields: [departmentId], references: [id], onDelete: SetNull)
+  // Atasan langsung: approver pertama untuk request pengadaan
+  supervisorId String?
+  supervisor   Employee?           @relation("Supervisor", fields: [supervisorId], references: [id], onDelete: SetNull)
+  subordinates Employee[]          @relation("Supervisor")
+  headOf       Department[]        @relation("DepartmentHead")
+  assets       Asset[]
+  assignments  AssignmentHistory[]
+  requests     AssetRequest[]
+  user         User?
 
   @@map("employees")
 }
