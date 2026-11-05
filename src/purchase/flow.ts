@@ -8,6 +8,7 @@ export const PR_STATUS = {
   PENDING_GA: "PENDING_GA",
   PENDING_FINANCE: "PENDING_FINANCE",
   IN_PROCUREMENT: "IN_PROCUREMENT",
+  PENDING_PAYMENT: "PENDING_PAYMENT",
   REJECTED: "REJECTED",
 } as const;
 
@@ -27,13 +28,16 @@ export const STATUS_AFTER_APPROVAL = PR_STATUS.IN_PROCUREMENT;
 export const LOG_STEP = {
   SUBMIT: "SUBMIT",
   ...Object.fromEntries(APPROVAL_STEPS.map((s) => [s, s])),
-} as Record<"SUBMIT" | ApprovalStep, string>;
+  PROCUREMENT: "PROCUREMENT",
+} as Record<"SUBMIT" | ApprovalStep | "PROCUREMENT", string>;
 
 export const LOG_ACTION = {
   SUBMITTED: "SUBMITTED",
   APPROVED: "APPROVED",
   REJECTED: "REJECTED",
   SKIPPED: "SKIPPED",
+  // Catatan / update progres tanpa mengubah status (mis. "barang masih dicari")
+  NOTE: "NOTE",
 } as const;
 
 export function stepOfStatus(status: string): ApprovalStep | null {
@@ -60,7 +64,7 @@ export const FULL_FLOW: { key: string; label: string; status?: string }[] = [
     status: STEP_STATUS[s],
   })),
   { key: "PROCUREMENT", label: "Procurement (pilih vendor)", status: PR_STATUS.IN_PROCUREMENT },
-  { key: "PAYMENT", label: "Payment" },
+  { key: "PAYMENT", label: "Payment", status: PR_STATUS.PENDING_PAYMENT },
   { key: "GA_VERIFY", label: "Verifikasi Barang (GA)" },
   { key: "RECORDING", label: "Pencatatan Aset" },
 ];
@@ -70,6 +74,7 @@ export const STATUS_LABEL: Record<string, string> = {
   PENDING_GA: "Menunggu Acknowledge GA",
   PENDING_FINANCE: "Menunggu Verifikasi Finance",
   IN_PROCUREMENT: "Proses Procurement",
+  PENDING_PAYMENT: "Menunggu Payment",
   REJECTED: "Ditolak",
 };
 
@@ -85,6 +90,11 @@ export function initialStatus(skip: ApprovalStep[]): { status: string; skipped: 
   }
   return { status: STATUS_AFTER_APPROVAL, skipped };
 }
+
+// Status setelah procurement selesai memilih vendor / link
+export const STATUS_AFTER_PROCUREMENT = PR_STATUS.PENDING_PAYMENT;
+
+export const PURCHASE_METHODS = ["vendor", "link"];
 
 export const REQUIREMENT_TYPES = ["product", "service", "troubleshooting", "ticket", "material", "other"];
 export const REQUIREMENT_ACTIONS = ["new", "upgrade", "downgrade", "additional"];

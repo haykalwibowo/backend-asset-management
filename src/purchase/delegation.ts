@@ -86,6 +86,11 @@ export function principalCanAct(
   }
 }
 
+// Procurement: user role procurement (atau penggantinya lewat delegasi)
+export function pickProcurementPrincipal(principals: Principal[]): Principal | null {
+  return principals.find((p) => p.role === ROLES.PROCUREMENT) ?? null;
+}
+
 // Pilih atas nama siapa user bertindak. Diri sendiri diutamakan, baru delegasi.
 export function pickActingPrincipal(
   step: ApprovalStep,

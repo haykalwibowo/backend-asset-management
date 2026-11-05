@@ -1,9 +1,11 @@
 import express from "express";
+import fs from "fs";
+import path from "path";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../prisma";
 import { AuthRequest } from "../middleware/auth";
 import { ROLES } from "../roles";
-import { singleDocument } from "../upload";
+import { singleDocument, uploadDir } from "../upload";
 import { resolveApprover } from "../approver";
 import {
   PR_STATUS,
@@ -15,6 +17,8 @@ import {
   REQUIREMENT_TYPES,
   REQUIREMENT_ACTIONS,
   REQUIREMENT_SCOPES,
+  STATUS_AFTER_PROCUREMENT,
+  PURCHASE_METHODS,
   stepOfStatus,
   statusAfter,
   initialStatus,
@@ -24,6 +28,7 @@ import {
   Principal,
   getPrincipals,
   pickActingPrincipal,
+  pickProcurementPrincipal,
   parseDateOnly,
   todayStr,
 } from "../purchase/delegation";
@@ -56,6 +61,7 @@ const summarySelect = {
   requesterDepartment: true,
   purpose: true,
   totalEstimate: true,
+  totalFinal: true,
   status: true,
   _count: { select: { items: true } },
 } satisfies Prisma.PurchaseRequestSelect;
@@ -63,13 +69,30 @@ const summarySelect = {
 type SummaryRow = Prisma.PurchaseRequestGetPayload<{ select: typeof summarySelect }>;
 
 function serializeSummary(pr: SummaryRow) {
-  const { _count, totalEstimate, ...rest } = pr;
+  const { _count, totalEstimate, totalFinal, ...rest } = pr;
+  const estimate = Number(totalEstimate);
+  const final = totalFinal === null ? null : Number(totalFinal);
   return {
     ...rest,
-    totalEstimate: Number(totalEstimate),
+    totalEstimate: estimate,
+    totalFinal: final,
+    overBudget: final !== null && final > estimate,
     itemCount: _count.items,
     statusLabel: STATUS_LABEL[pr.status] ?? pr.status,
   };
+}
+
+// Update progres terbaru (mis. dari procurement: "barang masih dicari") per pengajuan
+async function latestUpdates(ids: string[]) {
+  if (!ids.length) return new Map<string, { note: string | null; actorName: string | null; createdAt: Date }>();
+  const notes = await prisma.purchaseRequestLog.findMany({
+    where: { requestId: { in: ids }, action: LOG_ACTION.NOTE },
+    select: { requestId: true, note: true, actorName: true, createdAt: true },
+    orderBy: { createdAt: "desc" },
+  });
+  const map = new Map<string, { note: string | null; actorName: string | null; createdAt: Date }>();
+  for (const n of notes) if (!map.has(n.requestId)) map.set(n.requestId, n);
+  return map;
 }
 
 function serializeLog(l: Pick<LogRow, "id" | "step" | "action" | "actorName" | "actorPosition" | "onBehalfOfName" | "onBehalfOfPosition" | "note"> & { createdAt: Date }) {
@@ -94,10 +117,13 @@ function buildFlow(pr: DetailRequest) {
     GA: "Tim GA",
     FINANCE: "Tim Finance",
     PROCUREMENT: "Tim Procurement",
+    PAYMENT: "proses pembayaran",
   };
 
   return FULL_FLOW.map((f, idx) => {
-    const log = [...pr.logs].reverse().find((l) => l.step === f.key);
+    const stepLogs = pr.logs.filter((l) => l.step === f.key);
+    const log = [...stepLogs].reverse().find((l) => l.action !== LOG_ACTION.NOTE);
+    const notes = stepLogs.filter((l) => l.action === LOG_ACTION.NOTE).map(serializeLog);
     let state: "done" | "skipped" | "rejected" | "current" | "upcoming" | "cancelled";
     if (f.key === LOG_STEP.SUBMIT || log?.action === LOG_ACTION.APPROVED) state = "done";
     else if (log?.action === LOG_ACTION.SKIPPED) state = "skipped";
@@ -112,6 +138,7 @@ function buildFlow(pr: DetailRequest) {
       state,
       waitingFor: state === "current" ? waitingFor[f.key] ?? null : null,
       log: log ? serializeLog(log) : null,
+      notes,
     };
   });
 }
@@ -133,11 +160,21 @@ function inboxWhere(principals: Principal[]): Prisma.PurchaseRequestWhereInput |
   }
   if (principals.some((p) => p.role === ROLES.GA)) or.push({ status: PR_STATUS.PENDING_GA });
   if (principals.some((p) => p.role === ROLES.FINANCE)) or.push({ status: PR_STATUS.PENDING_FINANCE });
+  if (principals.some((p) => p.role === ROLES.PROCUREMENT)) or.push({ status: PR_STATUS.IN_PROCUREMENT });
   return or.length ? { OR: or } : null;
 }
 
 const cleanText = (v: unknown, max: number) =>
   typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null;
+
+function isHttpUrl(value: string) {
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 // ===== List =====
 // scope: mine (pengajuan saya) | inbox (perlu tindakan) | processed (pernah saya proses) | all
@@ -159,7 +196,7 @@ purchaseRequestsRouter.get("/", async (req: AuthRequest, res) => {
         logs: {
           some: {
             step: { not: LOG_STEP.SUBMIT },
-            action: { not: LOG_ACTION.SKIPPED },
+            action: { notIn: [LOG_ACTION.SKIPPED, LOG_ACTION.NOTE] },
             OR: [{ actorUserId: user.id }, { onBehalfOfUserId: user.id }],
           },
         },
@@ -184,7 +221,7 @@ purchaseRequestsRouter.get("/", async (req: AuthRequest, res) => {
         logs: {
           where: {
             step: { not: LOG_STEP.SUBMIT },
-            action: { not: LOG_ACTION.SKIPPED },
+            action: { notIn: [LOG_ACTION.SKIPPED, LOG_ACTION.NOTE] },
             OR: [{ actorUserId: user.id }, { onBehalfOfUserId: user.id }],
           },
           orderBy: { createdAt: "desc" },
@@ -192,9 +229,11 @@ purchaseRequestsRouter.get("/", async (req: AuthRequest, res) => {
         },
       },
     });
+    const updates = await latestUpdates(rows.map((r) => r.id));
     const result = rows
       .map(({ logs, ...pr }) => ({
         ...serializeSummary(pr),
+        latestUpdate: updates.get(pr.id) ?? null,
         myAction: logs[0] ? serializeLog(logs[0]) : null,
       }))
       // urut dari keputusan terbaru
@@ -209,7 +248,8 @@ purchaseRequestsRouter.get("/", async (req: AuthRequest, res) => {
     select: summarySelect,
     orderBy: { createdAt: scope === "inbox" ? "asc" : "desc" },
   });
-  res.json(rows.map(serializeSummary));
+  const updates = await latestUpdates(rows.map((r) => r.id));
+  res.json(rows.map((r) => ({ ...serializeSummary(r), latestUpdate: updates.get(r.id) ?? null })));
 });
 
 // Jumlah request yang menunggu tindakan saya (untuk badge)
@@ -235,6 +275,9 @@ purchaseRequestsRouter.get("/:id", async (req: AuthRequest, res) => {
 
   const step = stepOfStatus(pr.status);
   const acting = step ? pickActingPrincipal(step, principals, pr) : null;
+  const procurer =
+    pr.status === PR_STATUS.IN_PROCUREMENT ? pickProcurementPrincipal(principals) : null;
+  const totalFinal = pr.totalFinal === null ? null : Number(pr.totalFinal);
 
   res.json({
     id: pr.id,
@@ -257,17 +300,35 @@ purchaseRequestsRouter.get("/:id", async (req: AuthRequest, res) => {
     attachmentPath: pr.attachmentPath,
     attachmentName: pr.attachmentName,
     totalEstimate: Number(pr.totalEstimate),
+    totalFinal,
+    overBudget: totalFinal !== null && totalFinal > Number(pr.totalEstimate),
+    priceVarianceNote: pr.priceVarianceNote,
+    estimatedArrival: pr.estimatedArrival,
+    quotationPath: pr.quotationPath,
+    quotationName: pr.quotationName,
+    procuredAt: pr.procuredAt,
     status: pr.status,
     statusLabel: STATUS_LABEL[pr.status] ?? pr.status,
     supervisorApprover: pr.supervisorApprover,
-    items: pr.items.map((it) => ({
-      id: it.id,
-      lineNo: it.lineNo,
-      description: it.description,
-      quantity: it.quantity,
-      estimatedPrice: Number(it.estimatedPrice),
-      subtotal: Number(it.estimatedPrice) * it.quantity,
-    })),
+    items: pr.items.map((it) => {
+      const finalPrice = it.finalPrice === null ? null : Number(it.finalPrice);
+      return {
+        id: it.id,
+        lineNo: it.lineNo,
+        description: it.description,
+        quantity: it.quantity,
+        estimatedPrice: Number(it.estimatedPrice),
+        subtotal: Number(it.estimatedPrice) * it.quantity,
+        referenceLink: it.referenceLink,
+        purchaseMethod: it.purchaseMethod,
+        vendorName: it.vendorName,
+        vendorContact: it.vendorContact,
+        poNumber: it.poNumber,
+        purchaseLink: it.purchaseLink,
+        finalPrice,
+        finalSubtotal: finalPrice === null ? null : finalPrice * it.quantity,
+      };
+    }),
     logs: pr.logs.map(serializeLog),
     flow: buildFlow(pr),
     permissions: {
@@ -275,13 +336,19 @@ purchaseRequestsRouter.get("/:id", async (req: AuthRequest, res) => {
       step,
       onBehalfOf:
         acting?.viaDelegation ? { name: acting.name, position: acting.position } : null,
+      canProcure: !!procurer,
+      procureOnBehalfOf:
+        procurer?.viaDelegation ? { name: procurer.name, position: procurer.position } : null,
     },
   });
 });
 
 // ===== Buat pengajuan =====
 function parseItems(raw: unknown):
-  | { ok: true; items: { description: string; quantity: number; estimatedPrice: number }[] }
+  | {
+      ok: true;
+      items: { description: string; quantity: number; estimatedPrice: number; referenceLink: string | null }[];
+    }
   | { ok: false; message: string } {
   let parsed: unknown;
   try {
@@ -302,13 +369,22 @@ function parseItems(raw: unknown):
     const quantity = Number(it?.quantity);
     const estimatedPrice = Number(it?.estimatedPrice);
     if (!description) return { ok: false, message: `Deskripsi barang no. ${n} wajib diisi` };
+    const referenceLink = cleanText(it?.referenceLink, 2000);
+    if (referenceLink && !isHttpUrl(referenceLink)) {
+      return { ok: false, message: `Link pembelian barang no. ${n} harus diawali http:// atau https://` };
+    }
     if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100000) {
       return { ok: false, message: `Jumlah barang no. ${n} harus bilangan bulat minimal 1` };
     }
     if (!Number.isFinite(estimatedPrice) || estimatedPrice < 0 || estimatedPrice > MAX_PRICE) {
       return { ok: false, message: `Estimasi harga barang no. ${n} tidak valid` };
     }
-    items.push({ description, quantity, estimatedPrice: Math.round(estimatedPrice * 100) / 100 });
+    items.push({
+      description,
+      quantity,
+      estimatedPrice: Math.round(estimatedPrice * 100) / 100,
+      referenceLink,
+    });
   }
   return { ok: true, items };
 }
@@ -485,3 +561,251 @@ async function decide(req: AuthRequest, res: express.Response, approve: boolean)
 
 purchaseRequestsRouter.post("/:id/approve", (req: AuthRequest, res) => decide(req, res, true));
 purchaseRequestsRouter.post("/:id/reject", (req: AuthRequest, res) => decide(req, res, false));
+
+// ===== Procurement =====
+// Hanya role procurement (atau penggantinya lewat delegasi), saat status IN_PROCUREMENT.
+
+async function loadForProcurement(req: AuthRequest, res: express.Response) {
+  const id = req.params.id as string;
+  const pr = await prisma.purchaseRequest.findUnique({
+    where: { id },
+    include: { items: { orderBy: { lineNo: "asc" } } },
+  });
+  if (!pr) {
+    res.status(404).json({ message: "Request tidak ditemukan" });
+    return null;
+  }
+  if (pr.status !== PR_STATUS.IN_PROCUREMENT) {
+    res.status(400).json({ message: "Request ini tidak sedang di tahap procurement" });
+    return null;
+  }
+  const principals = await getPrincipals(req.user!.id);
+  const procurer = pickProcurementPrincipal(principals);
+  if (!procurer) {
+    res.status(403).json({ message: "Hanya tim Procurement yang bisa memproses tahap ini" });
+    return null;
+  }
+  const self = principals.find((p) => !p.viaDelegation)!;
+  return { pr, self, procurer };
+}
+
+function actorFields(self: Principal, acting: Principal) {
+  return {
+    actorUserId: self.userId,
+    actorName: self.name,
+    actorPosition: self.position,
+    onBehalfOfUserId: acting.viaDelegation ? acting.userId : null,
+    onBehalfOfName: acting.viaDelegation ? acting.name : null,
+    onBehalfOfPosition: acting.viaDelegation ? acting.position : null,
+  };
+}
+
+type ProcurementItemInput = {
+  id: string;
+  purchaseMethod: string | null;
+  vendorName: string | null;
+  vendorContact: string | null;
+  poNumber: string | null;
+  purchaseLink: string | null;
+  finalPrice: number | null;
+};
+
+// Validasi data procurement. Draft boleh belum lengkap; submit wajib lengkap.
+function parseProcurementItems(
+  raw: unknown,
+  existingIds: string[],
+  strict: boolean
+): { ok: true; items: ProcurementItemInput[] } | { ok: false; message: string } {
+  let parsed: unknown;
+  try {
+    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch {
+    return { ok: false, message: "Format data barang tidak valid" };
+  }
+  if (!Array.isArray(parsed)) return { ok: false, message: "Format data barang tidak valid" };
+
+  const byId = new Map(parsed.map((it: any) => [it?.id, it]));
+  const items: ProcurementItemInput[] = [];
+  for (const [i, id] of existingIds.entries()) {
+    const n = i + 1;
+    const it: any = byId.get(id) ?? {};
+    const method = cleanText(it.purchaseMethod, 20);
+    if (method && !PURCHASE_METHODS.includes(method)) {
+      return { ok: false, message: `Metode pembelian barang no. ${n} tidak valid` };
+    }
+    const purchaseLink = cleanText(it.purchaseLink, 2000);
+    if (purchaseLink && !isHttpUrl(purchaseLink)) {
+      return { ok: false, message: `Link pembelian barang no. ${n} harus diawali http:// atau https://` };
+    }
+    const priceRaw = it.finalPrice;
+    let finalPrice: number | null = null;
+    if (priceRaw !== null && priceRaw !== undefined && priceRaw !== "") {
+      finalPrice = Number(priceRaw);
+      if (!Number.isFinite(finalPrice) || finalPrice < 0 || finalPrice > MAX_PRICE) {
+        return { ok: false, message: `Harga final barang no. ${n} tidak valid` };
+      }
+      finalPrice = Math.round(finalPrice * 100) / 100;
+    }
+    const item: ProcurementItemInput = {
+      id,
+      purchaseMethod: method,
+      vendorName: cleanText(it.vendorName, 190),
+      vendorContact: cleanText(it.vendorContact, 190),
+      poNumber: cleanText(it.poNumber, 100),
+      purchaseLink,
+      finalPrice,
+    };
+
+    if (strict) {
+      if (!item.purchaseMethod) return { ok: false, message: `Pilih metode pembelian barang no. ${n} (Vendor / Link)` };
+      if (item.purchaseMethod === "vendor" && !item.vendorName) {
+        return { ok: false, message: `Nama vendor barang no. ${n} wajib diisi` };
+      }
+      if (item.purchaseMethod === "link" && !item.purchaseLink) {
+        return { ok: false, message: `Link pembelian barang no. ${n} wajib diisi` };
+      }
+      if (item.finalPrice === null) return { ok: false, message: `Harga final barang no. ${n} wajib diisi` };
+    }
+    items.push(item);
+  }
+  return { ok: true, items };
+}
+
+// Simpan data procurement. submit=true -> selesai, lanjut ke Payment.
+purchaseRequestsRouter.post(
+  "/:id/procurement",
+  singleDocument("quotation", "dokumen quotation"),
+  async (req: AuthRequest, res) => {
+    const ctx = await loadForProcurement(req, res);
+    if (!ctx) return;
+    const { pr, self, procurer } = ctx;
+    const b = req.body ?? {};
+    const submit = b.submit === "true" || b.submit === true;
+
+    const parsed = parseProcurementItems(b.items, pr.items.map((it) => it.id), submit);
+    if (!parsed.ok) return res.status(400).json({ message: parsed.message });
+
+    let estimatedArrival: Date | null = null;
+    if (b.estimatedArrival) {
+      estimatedArrival = parseDateOnly(b.estimatedArrival);
+      if (!estimatedArrival) return res.status(400).json({ message: "Perkiraan tanggal datang tidak valid" });
+    }
+
+    const qtyById = new Map(pr.items.map((it) => [it.id, it.quantity]));
+    const allPriced = parsed.items.every((it) => it.finalPrice !== null);
+    const totalFinal = allPriced
+      ? parsed.items.reduce((s, it) => s + (it.finalPrice ?? 0) * (qtyById.get(it.id) ?? 0), 0)
+      : null;
+    const priceVarianceNote = cleanText(b.priceVarianceNote, 2000);
+    const overBudget = totalFinal !== null && totalFinal > Number(pr.totalEstimate);
+
+    if (submit && overBudget && !priceVarianceNote) {
+      return res.status(400).json({
+        message: "Total harga final melebihi estimasi. Isi catatan selisih harga untuk Finance.",
+      });
+    }
+
+    const oldQuotation = req.file ? pr.quotationPath : null;
+
+    try {
+      await prisma.$transaction(async (tx) => {
+        for (const it of parsed.items) {
+          const { id, ...data } = it;
+          await tx.purchaseRequestItem.update({ where: { id }, data });
+        }
+
+        const data: Prisma.PurchaseRequestUpdateManyMutationInput = {
+          estimatedArrival,
+          totalFinal,
+          priceVarianceNote: overBudget ? priceVarianceNote : null,
+          ...(req.file
+            ? { quotationPath: req.file.filename, quotationName: req.file.originalname.slice(0, 190) }
+            : {}),
+          ...(submit ? { status: STATUS_AFTER_PROCUREMENT, procuredAt: new Date() } : {}),
+        };
+        // Cegah dua orang menyelesaikan tahap yang sama bersamaan
+        const updated = await tx.purchaseRequest.updateMany({
+          where: { id: pr.id, status: PR_STATUS.IN_PROCUREMENT },
+          data,
+        });
+        if (updated.count === 0) throw new Error("CONFLICT");
+
+        if (submit) {
+          await tx.purchaseRequestLog.create({
+            data: {
+              requestId: pr.id,
+              step: LOG_STEP.PROCUREMENT,
+              action: LOG_ACTION.APPROVED,
+              ...actorFields(self, procurer),
+              note: overBudget ? `Melebihi estimasi: ${priceVarianceNote}` : null,
+            },
+          });
+        }
+      });
+    } catch (e) {
+      if (e instanceof Error && e.message === "CONFLICT") {
+        return res.status(409).json({ message: "Request ini sudah diproses. Muat ulang halaman." });
+      }
+      console.error("procurement save error:", e);
+      return res.status(400).json({ message: "Gagal menyimpan data procurement", error: String(e) });
+    }
+
+    // Quotation lama diganti -> hapus filenya
+    if (oldQuotation) fs.unlink(path.join(uploadDir, oldQuotation), () => {});
+
+    const status = submit ? STATUS_AFTER_PROCUREMENT : PR_STATUS.IN_PROCUREMENT;
+    res.json({ id: pr.id, status, statusLabel: STATUS_LABEL[status], totalFinal, overBudget });
+  }
+);
+
+// Kirim update progres ke pemohon (status tidak berubah)
+purchaseRequestsRouter.post("/:id/procurement/note", async (req: AuthRequest, res) => {
+  const ctx = await loadForProcurement(req, res);
+  if (!ctx) return;
+  const note = cleanText(req.body?.note, 1000);
+  if (!note) return res.status(400).json({ message: "Isi pesan update dulu" });
+
+  await prisma.purchaseRequestLog.create({
+    data: {
+      requestId: ctx.pr.id,
+      step: LOG_STEP.PROCUREMENT,
+      action: LOG_ACTION.NOTE,
+      ...actorFields(ctx.self, ctx.procurer),
+      note,
+    },
+  });
+  res.status(201).json({ ok: true });
+});
+
+// Batalkan pengajuan di tahap procurement (mis. barang tidak tersedia). Catatan wajib.
+purchaseRequestsRouter.post("/:id/procurement/cancel", async (req: AuthRequest, res) => {
+  const ctx = await loadForProcurement(req, res);
+  if (!ctx) return;
+  const note = cleanText(req.body?.note, 1000);
+  if (!note) return res.status(400).json({ message: "Catatan alasan pembatalan wajib diisi" });
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      const updated = await tx.purchaseRequest.updateMany({
+        where: { id: ctx.pr.id, status: PR_STATUS.IN_PROCUREMENT },
+        data: { status: PR_STATUS.REJECTED },
+      });
+      if (updated.count === 0) throw new Error("CONFLICT");
+      await tx.purchaseRequestLog.create({
+        data: {
+          requestId: ctx.pr.id,
+          step: LOG_STEP.PROCUREMENT,
+          action: LOG_ACTION.REJECTED,
+          ...actorFields(ctx.self, ctx.procurer),
+          note,
+        },
+      });
+    });
+  } catch (e) {
+    if (e instanceof Error && e.message === "CONFLICT") {
+      return res.status(409).json({ message: "Request ini sudah diproses. Muat ulang halaman." });
+    }
+    return res.status(400).json({ message: "Gagal membatalkan request", error: String(e) });
+  }
+  res.json({ id: ctx.pr.id, status: PR_STATUS.REJECTED, statusLabel: STATUS_LABEL[PR_STATUS.REJECTED] });
+});

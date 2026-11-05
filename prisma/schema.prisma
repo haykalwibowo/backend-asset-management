@@ -183,6 +183,15 @@ model PurchaseRequest {
 
   status String
 
+  // ===== Diisi procurement =====
+  estimatedArrival  DateTime? @db.Date
+  quotationPath     String?
+  quotationName     String?
+  totalFinal        Decimal?  @db.Decimal(15, 2)
+  // Wajib diisi kalau total final melebihi estimasi; ditampilkan ke Finance
+  priceVarianceNote String?   @db.Text
+  procuredAt        DateTime?
+
   // Approver tahap atasan, ditentukan saat pengajuan. null = tahap atasan dilewati.
   supervisorApproverId String?
   supervisorApprover   Employee? @relation("PRSupervisorApprover", fields: [supervisorApproverId], references: [id], onDelete: SetNull)
@@ -205,6 +214,16 @@ model PurchaseRequestItem {
   description    String          @db.Text
   quantity       Int
   estimatedPrice Decimal         @db.Decimal(15, 2)
+  // Link referensi pembelian dari pemohon (opsional)
+  referenceLink  String?         @db.Text
+
+  // ===== Diisi procurement =====
+  purchaseMethod String? // vendor | link
+  vendorName     String?
+  vendorContact  String?
+  poNumber       String?
+  purchaseLink   String?  @db.Text
+  finalPrice     Decimal? @db.Decimal(15, 2) // harga final per unit
 
   @@index([requestId])
   @@map("purchase_request_items")
@@ -215,8 +234,8 @@ model PurchaseRequestLog {
   id        String          @id @default(uuid())
   requestId String
   request   PurchaseRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
-  step      String // SUBMIT | SUPERVISOR | GA | FINANCE
-  action    String // SUBMITTED | APPROVED | REJECTED | SKIPPED
+  step      String // SUBMIT | SUPERVISOR | GA | FINANCE | PROCUREMENT
+  action    String // SUBMITTED | APPROVED | REJECTED | SKIPPED | NOTE
 
   actorUserId   String?
   actor         User?   @relation("PRLogActor", fields: [actorUserId], references: [id], onDelete: SetNull)
